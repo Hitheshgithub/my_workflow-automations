@@ -1,0 +1,227 @@
+# encrypt the kms key code
+name: non_prod-multi-region_aws_kms_encrypt
+  
+on:  
+  workflow_dispatch:  
+    inputs:  
+      use_secret:  
+        description: "The plaintext must be stored as a GitHub Secret named 'PLAINTEXT_TO_ENCRYPT'"  
+        required: true  
+        type: boolean
+        default: true
+  
+jobs:  
+  encrypt:
+    runs-on:  
+      group: selfhosted-runners  
+      labels: [self-hosted, Linux, us-east-1]
+  
+    steps:  
+      - uses: actions/checkout@v4
+
+      - name: Install 7-Zip
+        shell: bash
+        run: |
+          if ! command -v 7z &> /dev/null; then
+            echo "Installing p7zip..."
+            
+            if command -v yum &> /dev/null; then
+              sudo yum install -y p7zip p7zip-plugins
+            elif command -v dnf &> /dev/null; then
+              sudo dnf install -y p7zip p7zip-plugins
+            elif command -v apt-get &> /dev/null; then
+              sudo apt-get update
+              sudo apt-get install -y p7zip-full
+            elif command -v zypper &> /dev/null; then
+              sudo zypper install -y p7zip
+            else
+              echo "Error: Package manager not found."
+              exit 1
+            fi
+          else
+            echo "7z is already installed"
+          fi
+          
+          7z --help > /dev/null || { echo "7z installation failed"; exit 1; }
+  
+      - name: Encrypt plaintext with AWS KMS  
+        id: encrypt  
+        shell: bash
+        env:
+          PLAINTEXT: ${{ secrets.PLAINTEXT_TO_ENCRYPT }}
+        run: |  
+          set -euo pipefail
+  
+          if [ -z "$PLAINTEXT" ]; then
+            echo "Error: PLAINTEXT_TO_ENCRYPT secret is not set"
+            echo "Please add it in Settings > Secrets and variables > Actions"
+            exit 1
+          fi
+  
+          KMS_KEY_ARN=<add the arn>
+  
+          printf '%s' "$PLAINTEXT" > plaintext.txt
+  
+          CIPHER_B64="$(aws kms encrypt --key-id "$KMS_KEY_ARN" --plaintext fileb://plaintext.txt --query CiphertextBlob --output text --region us-east-1 | tr -d '\r\n')"
+  
+          echo "::add-mask::$CIPHER_B64"
+          
+          echo "$CIPHER_B64" > encrypted_output.txt
+          
+          echo "Encryption completed successfully"
+          
+          rm -f plaintext.txt
+  
+      - name: Create password-protected archive
+        shell: bash
+        env:
+          ARCHIVE_PASSWORD: ${{ secrets.ARCHIVE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          
+          7z a -p"$ARCHIVE_PASSWORD" -tzip encrypted_output.zip encrypted_output.txt
+          
+          echo "Password-protected archive created successfully"
+          
+          rm -f encrypted_output.txt
+  
+      - name: Upload encrypted output as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: encrypted-kms-output
+          path: encrypted_output.zip
+          retention-days: 7
+  
+      - name: Output completion message
+        shell: bash  
+        run: |  
+          echo "✓ Encryption completed"
+          echo "✓ Encrypted output saved to password-protected archive"
+          echo "✓ Download the artifact 'encrypted-kms-output'"
+          echo ""
+          echo "To extract: unzip or 7z x encrypted_output.zip"
+
+
+# decrypt the kms key value 
+
+name: non_prod-multi-region_aws_kms_decrypt
+
+on:  
+  workflow_dispatch:  
+    inputs:  
+      use_secret:  
+        description: "The ciphertext must be stored as a GitHub Secret named 'CIPHERTEXT_TO_DECRYPT'"  
+        required: true  
+        type: boolean
+        default: true
+
+jobs:  
+  decrypt:  
+    runs-on:  
+      group: selfhosted-runners  
+      labels: [self-hosted, Linux, us-east-1]
+      
+    steps:  
+      - uses: actions/checkout@v4
+
+      - name: Install 7-Zip
+        shell: bash
+        run: |
+          if ! command -v 7z &> /dev/null; then
+            echo "Installing p7zip..."
+            
+            if command -v yum &> /dev/null; then
+              sudo yum install -y p7zip p7zip-plugins
+            elif command -v dnf &> /dev/null; then
+              sudo dnf install -y p7zip p7zip-plugins
+            elif command -v apt-get &> /dev/null; then
+              sudo apt-get update
+              sudo apt-get install -y p7zip-full
+            elif command -v zypper &> /dev/null; then
+              sudo zypper install -y p7zip
+            else
+              echo "Error: Package manager not found."
+              exit 1
+            fi
+          else
+            echo "7z is already installed"
+          fi
+          
+          7z --help > /dev/null || { echo "7z installation failed"; exit 1; }
+
+      - name: Decrypt ciphertext with AWS KMS
+        id: decrypt
+        shell: bash
+        env:
+          CIPHERTEXT: ${{ secrets.CIPHERTEXT_TO_DECRYPT }}
+        run: |
+          set -euo pipefail
+          
+          if [ -z "$CIPHERTEXT" ]; then
+            echo "Error: CIPHERTEXT_TO_DECRYPT secret is not set"
+            echo "Please add it in Settings > Secrets and variables > Actions"
+            exit 1
+          fi
+          
+          # Save the ciphertext to file
+          echo "$CIPHERTEXT" > encrypted.txt
+          
+          echo "Processing encrypted value..."
+          
+          # Decode base64 to binary
+          base64 -d encrypted.txt > encrypted.bin
+          
+          # Check file size
+          echo "Encrypted binary size: $(ls -lh encrypted.bin | awk '{print $5}')"
+          
+          # Decrypt using AWS KMS
+          echo "Decrypting with AWS KMS..."
+          PLAINTEXT=$(aws kms decrypt --ciphertext-blob fileb://encrypted.bin --key-id <add arn here> --output text --query Plaintext --region us-east-1)
+          
+          if [ -z "$PLAINTEXT" ]; then
+            echo "Error: Decryption failed or returned empty output."
+            exit 1
+          fi
+          
+          # Decode base64 output from KMS
+          echo "$PLAINTEXT" | base64 -d > decrypted.txt
+          
+          # Mask the decrypted value in logs
+          DECRYPTED_VALUE=$(cat decrypted.txt)
+          echo "::add-mask::$DECRYPTED_VALUE"
+          
+          echo "Decryption completed successfully"
+          
+          # Clean up temporary files
+          rm -f encrypted.txt encrypted.bin
+
+      - name: Create password-protected archive
+        shell: bash
+        env:
+          ARCHIVE_PASSWORD: ${{ secrets.ARCHIVE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          
+          # Create password-protected archive using 7z
+          7z a -p"$ARCHIVE_PASSWORD" -tzip decrypted_output.zip decrypted.txt
+          
+          echo "Password-protected archive created successfully"
+          
+          # Clean up unprotected file
+          rm -f decrypted.txt
+
+      - name: Upload decrypted output as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: decrypted-kms-output
+          path: decrypted_output.zip
+          retention-days: 7
+
+      - name: Output completion message
+        shell: bash
+        run: |
+          echo "✓ Decryption completed"
+          echo "✓ Decrypted output saved to password-protected archive"
+          echo "✓ Download the artifact 'decrypted-kms-output'"
+          echo ""
+          echo "To extract: unzip or 7z x decrypted_output.zip"
