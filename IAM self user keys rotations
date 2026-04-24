@@ -1,0 +1,103 @@
+name: Rotate IAM access key and update Secrets Manager for SES
+
+on:
+  workflow_dispatch:
+  # Optional schedule
+  # schedule:
+  #   - cron: "0 3 * * 0"   # Every Sunday at 03:00 UTC
+
+permissions:
+  contents: read
+  
+
+jobs:
+  rotate-access-key:
+    runs-on:
+      group: selfhosted-runners
+      labels: [self-hosted, Linux, us-east-1]
+
+    env:
+      AWS_REGION: us-east-1
+      SECRET_ID: <add secret id>
+      IAM_USER_NAME:< add arn here>
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      
+
+      - name: Verify dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v aws >/dev/null 2>&1 || { echo "aws CLI not found"; exit 1; }
+          command -v jq >/dev/null 2>&1 || { echo "jq not found"; exit 1; }
+
+      - name: Rotate IAM access key
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Starting rotation for IAM user: $IAM_USER_ARN"
+
+          echo "Fetching current secret from Secrets Manager..."
+          secret_output=$(aws secretsmanager get-secret-value --secret-id "$SECRET_ID" --region "$AWS_REGION")
+
+          old_access_key=$(echo "$secret_output" | jq -r '.SecretString | fromjson | keys[0]')
+          old_secret_key=$(echo "$secret_output" | jq -r '.SecretString | fromjson | .[keys[0]]')
+
+          if [[ -z "$old_access_key" || "$old_access_key" == "null" ]]; then
+            echo "Could not extract old access key from secret."
+            exit 1
+          fi
+
+          if [[ -z "$old_secret_key" || "$old_secret_key" == "null" ]]; then
+            echo "Could not extract old secret key from secret."
+            exit 1
+          fi
+
+          echo "::add-mask::$old_access_key"
+          echo "::add-mask::$old_secret_key"
+
+          echo "Switching AWS CLI to use the current IAM user access key..."
+          export AWS_ACCESS_KEY_ID="$old_access_key"
+          export AWS_SECRET_ACCESS_KEY="$old_secret_key"
+          export AWS_DEFAULT_REGION="$AWS_REGION"
+
+          echo "Creating new access key..."
+          create_output=$(aws iam create-access-key --user-name "$IAM_USER_NAME")
+
+          new_access_key=$(echo "$create_output" | jq -r '.AccessKey.AccessKeyId')
+          new_secret_key=$(echo "$create_output" | jq -r '.AccessKey.SecretAccessKey')
+
+          if [[ -z "$new_access_key" || "$new_access_key" == "null" ]]; then
+            echo "Failed to create new access key."
+            exit 1
+          fi
+
+          if [[ -z "$new_secret_key" || "$new_secret_key" == "null" ]]; then
+            echo "Failed to retrieve new secret access key."
+            exit 1
+          fi
+
+          echo "::add-mask::$new_access_key"
+          echo "::add-mask::$new_secret_key"
+
+          echo "Deleting old access key..."
+          aws iam delete-access-key --user-name "$IAM_USER_NAME" --access-key-id "$old_access_key"
+
+          echo "Current access keys after deletion:"
+          aws iam list-access-keys --user-name "$IAM_USER_NAME"
+
+          echo "Preparing Secrets Manager payload..."
+          payload=$(jq -cn --arg k "$new_access_key" --arg v "$new_secret_key" '{($k): $v}')
+
+          echo "Clearing temporary IAM user credentials from environment..."
+          unset AWS_ACCESS_KEY_ID
+          unset AWS_SECRET_ACCESS_KEY
+
+          echo "Updating Secrets Manager with new key..."
+          aws secretsmanager put-secret-value --region "$AWS_REGION" --secret-id "$SECRET_ID" --secret-string "$payload"
+
+          echo "Access key rotation completed successfully."
