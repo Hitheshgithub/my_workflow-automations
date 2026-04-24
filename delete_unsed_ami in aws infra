@@ -1,0 +1,786 @@
+import boto3
+import re
+import pandas as pd
+import awslib as aws
+import time
+import yaml
+import os
+import sys
+from datetime import datetime, timedelta
+
+# Configuration: Minimum AMI age in days before it can be deleted
+MIN_AMI_AGE_DAYS = 30
+
+with open(f"{os.getcwd()}/scripts/python/GAMI/vars.yml", "r") as f:
+    vars = yaml.safe_load(f)
+
+PRDRegion = str(vars["regions"]["prd"])
+DRRegion = str(vars["regions"]["dr"])
+
+def get_ec2_client(region, env):
+    """Get EC2 client for specified region and environment"""
+    # Use different AWS profiles/sessions based on environment
+    if env.lower() in ['preprod', 'nonprod']:
+        # For PreProd, we might need to use a different session or assume role
+        # For now, using default session but this might need adjustment
+        return boto3.client('ec2', region_name=region)
+    else:
+        # For Prod
+        return boto3.client('ec2', region_name=region)
+
+def get_ami_age_days(creation_date_str):
+    """Calculate AMI age in days"""
+    try:
+        creation_date = datetime.strptime(creation_date_str.split('T')[0], '%Y-%m-%d')
+        return (datetime.now() - creation_date).days
+    except Exception as e:
+        print(f"{aws.log_time()} Error calculating AMI age: {e}")
+        return 0
+
+def is_ami_old_enough(creation_date_str, min_age_days=MIN_AMI_AGE_DAYS):
+    """Check if AMI is old enough to be deleted"""
+    age_days = get_ami_age_days(creation_date_str)
+    return age_days >= min_age_days
+
+def describe_all_instances_multi_region(TagKey, TagValue, regions, env):
+    """Get all AMI IDs currently in use by instances across multiple regions"""
+    ami_ids = []
+    total_instances = 0
+    
+    for region in regions:
+        try:
+            client = get_ec2_client(region, env)
+            
+            # First, let's get ALL instances to see what's there
+            print(f"{aws.log_time()} Checking all instances in region {region}...")
+            all_instances_response = client.describe_instances()
+            all_instances_count = 0
+            for reservation in all_instances_response['Reservations']:
+                all_instances_count += len(reservation['Instances'])
+            print(f"{aws.log_time()} Total instances in region {region}: {all_instances_count}")
+            
+            # Now get instances with specific tags
+            print(f"{aws.log_time()} Looking for instances with tag {TagKey}={TagValue} in region {region}")
+            response = client.describe_instances(
+                Filters=[
+                    {
+                        'Name': f'tag:{TagKey}',
+                        'Values': [f'{TagValue}']
+                    }
+                ]
+            )
+            
+            region_instances = 0
+            region_amis = []
+            for reservation in response['Reservations']:
+                for instance in reservation['Instances']:
+                    region_instances += 1
+                    if instance['State']['Name'] in ['running', 'stopped', 'stopping', 'starting']:
+                        ami_id = instance['ImageId']
+                        ami_ids.append(ami_id)
+                        region_amis.append(ami_id)
+                        print(f"{aws.log_time()} Found instance {instance['InstanceId']} using AMI {ami_id} in state {instance['State']['Name']}")
+            
+            total_instances += region_instances
+            unique_region_amis = list(set(region_amis))
+            print(f"{aws.log_time()} Found {region_instances} instances with tag {TagKey}={TagValue} in region {region}")
+            print(f"{aws.log_time()} Found {len(unique_region_amis)} unique AMIs in use in region {region}")
+            
+            # If no instances found with the tag, let's check what tags exist
+            if region_instances == 0:
+                print(f"{aws.log_time()} No instances found with tag {TagKey}={TagValue}. Checking existing tags...")
+                sample_response = client.describe_instances(MaxResults=10)
+                for reservation in sample_response['Reservations']:
+                    for instance in reservation['Instances']:
+                        if 'Tags' in instance:
+                            print(f"{aws.log_time()} Sample instance {instance['InstanceId']} tags: {instance['Tags']}")
+                        else:
+                            print(f"{aws.log_time()} Sample instance {instance['InstanceId']} has no tags")
+                        break  # Just show first instance
+                    if reservation['Instances']:
+                        break
+                        
+        except Exception as e:
+            print(f"{aws.log_time()} Error describing instances in region {region}: {e}")
+    
+    unique_amis = list(set(ami_ids))
+    print(f"{aws.log_time()} Total instances found across all regions: {total_instances}")
+    print(f"{aws.log_time()} Total unique AMIs in use across all regions: {len(unique_amis)}")
+    return unique_amis
+
+def list_all_service_amis(client, serviceName):
+    """List all AMIs for a specific service, excluding cp-nginx-server"""
+    if serviceName == "cp-nginx-server":
+        print(f"{aws.log_time()} Skipping cp-nginx-server AMIs as requested")
+        return []
+    
+    try:
+        print(f"{aws.log_time()} Looking for AMIs with pattern: a205159-{serviceName}-*")
+        response = client.describe_images(
+            Filters=[
+                {
+                    "Name": 'name',
+                    "Values": [f"a205159-{serviceName}-*"]
+                }
+            ],
+            Owners=['self']
+        )
+        amis = []
+        for ami in response['Images']:
+            ami_age = get_ami_age_days(ami['CreationDate'])
+            amis.append({
+                'Name': ami['Name'],
+                'ImageId': ami['ImageId'],
+                'CreationDate': ami['CreationDate'],
+                'Age': ami_age
+            })
+        print(f"{aws.log_time()} Found {len(amis)} AMIs for service {serviceName}")
+        return amis
+    except Exception as e:
+        print(f"{aws.log_time()} Error listing AMIs for service {serviceName}: {e}")
+        return []
+
+def list_service_names(client, TagKey, TagValue):
+    """Get service names from instances"""
+    try:
+        response = client.describe_instances(
+            Filters=[
+                {
+                    'Name': f'tag:{TagKey}',
+                    'Values': [f'{TagValue}']
+                }
+            ]
+        )
+        service_names = []
+        for reservation in response['Reservations']:
+            for instance in reservation['Instances']:
+                if instance['State']['Name'] in ['running', 'stopped', 'stopping', 'starting']:
+                    ami_id = instance['ImageId']
+                    try:
+                        ami_response = client.describe_images(
+                            Owners=['self'],
+                            ImageIds=[ami_id]
+                        )
+                        for amiInfo in ami_response['Images']:
+                            service_name = re.sub('-[0-9].[0-9]*.[0-9]*.[0-9]*', '', amiInfo['Name'].replace('a205159-',''))
+                            service_names.append(service_name)
+                            print(f"{aws.log_time()} Found service: {service_name} from AMI: {amiInfo['Name']}")
+                    except Exception as e:
+                        print(f"{aws.log_time()} Could not get AMI info for {ami_id}: {e}")
+                        continue
+        return service_names
+    except Exception as e:
+        print(f"{aws.log_time()} Error getting service names: {e}")
+        return []
+
+def uni_service(client, TagKey, TagValue):
+    """Get unique service names"""
+    uni = []
+    service_names = list_service_names(client, TagKey, TagValue)
+    for names in service_names:
+        if names not in uni and names != "cp-nginx-server":
+            uni.append(names)
+    print(f"{aws.log_time()} Unique services found: {uni}")
+    return uni
+
+def get_all_amis_for_cleanup(client, service_type):
+    """Get all AMIs that could potentially be cleaned up"""
+    try:
+        print(f"{aws.log_time()} Getting all AMIs owned by self for {service_type}")
+        response = client.describe_images(
+            Owners=['self'],
+            Filters=[
+                {
+                    'Name': 'name',
+                    'Values': ['a205159-*']
+                }
+            ]
+        )
+        
+        amis = []
+        for ami in response['Images']:
+            ami_name = ami['Name']
+            # Skip cp-nginx-server AMIs
+            if 'cp-nginx-server' in ami_name:
+                continue
+                
+            ami_age = get_ami_age_days(ami['CreationDate'])
+            service_name = re.sub('-[0-9].[0-9]*.[0-9]*.[0-9]*', '', ami_name.replace('a205159-',''))
+            
+            amis.append({
+                'Name': ami_name,
+                'ImageId': ami['ImageId'],
+                'CreationDate': ami['CreationDate'],
+                'Age': ami_age,
+                'Service': service_name
+            })
+        
+        print(f"{aws.log_time()} Found {len(amis)} total AMIs owned by self (excluding cp-nginx-server)")
+        return amis
+    except Exception as e:
+        print(f"{aws.log_time()} Error getting all AMIs: {e}")
+        return []
+
+def main(argv):
+    HELP = 'delete_unused_images.py <microservices/infraservices> <dry-run|cleanup> <PreProd/Prod>'
+
+    if len(argv) < 4:
+        print('Missing arguments.')
+        print('Usage: ' + HELP)
+        sys.exit(2)
+    elif len(argv) > 4:
+        print("Pass only required arguments")
+        print("usage: " + HELP)
+        sys.exit(2)
+    if argv[1] not in ("microservices", "infraservices") or argv[2] not in ("dry-run", "cleanup"):
+        print("Unknown arguments")
+        print("Usage: " + HELP)
+        sys.exit(2)
+    
+    SERVICE_TYPE = argv[1]
+    ACTION = argv[2]
+    ENV = argv[3]
+
+    # Set up regions to check - both PR and DR
+    regions_to_check = [PRDRegion, DRRegion]
+    print(f"{aws.log_time()} Checking AMI usage across regions: {regions_to_check}")
+
+    # Set up primary region for AMI scanning (where AMIs are stored)
+    primary_region = PRDRegion
+    client = get_ec2_client(primary_region, ENV)
+
+    if SERVICE_TYPE == "microservices":
+        GlobalTagKey = str(vars["tags"]["key"])
+        GlobalTagValue = str(vars["tags"]["value"])
+    elif SERVICE_TYPE == "infraservices":
+        GlobalTagKey = str(vars["infra_tags"]["key"])
+        GlobalTagValue = str(vars["infra_tags"]["value"])
+
+    print(f"{aws.log_time()} Starting AMI cleanup process")
+    print(f"{aws.log_time()} Service Type: {SERVICE_TYPE}")
+    print(f"{aws.log_time()} Action: {ACTION}")
+    print(f"{aws.log_time()} Environment: {ENV}")
+    print(f"{aws.log_time()} Primary Region: {primary_region}")
+    print(f"{aws.log_time()} Checking usage in regions: {', '.join(regions_to_check)}")
+    print(f"{aws.log_time()} Tag Key: {GlobalTagKey}")
+    print(f"{aws.log_time()} Tag Value: {GlobalTagValue}")
+    print(f"{aws.log_time()} Minimum AMI age for deletion: {MIN_AMI_AGE_DAYS} days")
+    print(f"{aws.log_time()} Excluding: a205159-cp-nginx-server AMIs")
+
+    # Get all AMIs currently in use across all regions
+    amis_in_use = describe_all_instances_multi_region(GlobalTagKey, GlobalTagValue, regions_to_check, ENV)
+
+    df_instance = pd.DataFrame()
+    result = []
+    result_details = []
+    skipped_due_to_age = []
+
+    # If no instances found with tags, let's try a different approach - check all AMIs
+    if len(amis_in_use) == 0:
+        print(f"{aws.log_time()} No instances found with specified tags. Checking all AMIs for potential cleanup...")
+        all_amis = get_all_amis_for_cleanup(client, SERVICE_TYPE)
+        
+        # Get AMIs in use by ANY instance (not just tagged ones)
+        print(f"{aws.log_time()} Getting AMIs in use by ANY instance...")
+        all_amis_in_use = []
+        for region in regions_to_check:
+            try:
+                region_client = get_ec2_client(region, ENV)
+                response = region_client.describe_instances()
+                for reservation in response['Reservations']:
+                    for instance in reservation['Instances']:
+                        if instance['State']['Name'] in ['running', 'stopped', 'stopping', 'starting']:
+                            all_amis_in_use.append(instance['ImageId'])
+            except Exception as e:
+                print(f"{aws.log_time()} Error getting all instances in region {region}: {e}")
+        
+        unique_amis_in_use = list(set(all_amis_in_use))
+        print(f"{aws.log_time()} Found {len(unique_amis_in_use)} AMIs in use by ANY instance across all regions")
+        
+        # Process all AMIs
+        for ami in all_amis:
+            ami_name = ami['Name']
+            ami_id = ami['ImageId']
+            ami_age = ami['Age']
+            creation_date = ami['CreationDate'].split('T')[0]
+            service_name = ami['Service']
+            
+            if ami_id not in unique_amis_in_use:
+                # Check if AMI is old enough to be deleted
+                if ami_age >= MIN_AMI_AGE_DAYS:
+                    if ACTION == "dry-run":
+                        print(f"{aws.log_time()} [DRY-RUN] Would delete unused AMI: {ami_name} (ID: {ami_id}, Age: {ami_age} days)")
+                    elif ACTION == "cleanup":
+                        print(f"{aws.log_time()} Deleting unused AMI: {ami_name} (ID: {ami_id}, Age: {ami_age} days)")
+                        aws.aws_delete_images(primary_region, ami_id)
+                        time.sleep(10)
+                        print(f"{aws.log_time()} Successfully deleted AMI {ami_name}")
+                    
+                    result.append(ami_name)
+                    result_details.append({
+                        'AMI Name': ami_name,
+                        'AMI ID': ami_id,
+                        'Age (Days)': ami_age,
+                        'Creation Date': creation_date,
+                        'Service': service_name
+                    })
+                else:
+                    print(f"{aws.log_time()} Skipping AMI (too young): {ami_name} (ID: {ami_id}, Age: {ami_age} days < {MIN_AMI_AGE_DAYS} days)")
+                    skipped_due_to_age.append({
+                        'AMI Name': ami_name,
+                        'AMI ID': ami_id,
+                        'Age (Days)': ami_age,
+                        'Creation Date': creation_date,
+                        'Service': service_name
+                    })
+            else:
+                print(f"{aws.log_time()} AMI in use: {ami_name} (ID: {ami_id}, Age: {ami_age} days)")
+    else:
+        # Original logic when instances with tags are found
+        unique_services = uni_service(client, GlobalTagKey, GlobalTagValue)
+        print(f"{aws.log_time()} Found {len(unique_services)} unique services to process")
+        
+        for service_name in unique_services:
+            print(f"{aws.log_time()} Processing service: {service_name}")
+            service_amis = list_all_service_amis(client, service_name)
+            
+            for ami in service_amis:
+                ami_name = ami['Name']
+                ami_id = ami['ImageId']
+                ami_age = ami['Age']
+                creation_date = ami['CreationDate'].split('T')[0]
+                
+                if ami_id not in amis_in_use:
+                    # Check if AMI is old enough to be deleted
+                    if ami_age >= MIN_AMI_AGE_DAYS:
+                        if ACTION == "dry-run":
+                            print(f"{aws.log_time()} [DRY-RUN] Would delete unused AMI: {ami_name} (ID: {ami_id}, Age: {ami_age} days)")
+                        elif ACTION == "cleanup":
+                            print(f"{aws.log_time()} Deleting unused AMI: {ami_name} (ID: {ami_id}, Age: {ami_age} days)")
+                            aws.aws_delete_images(primary_region, ami_id)
+                            time.sleep(10)
+                            print(f"{aws.log_time()} Successfully deleted AMI {ami_name}")
+                        
+                        result.append(ami_name)
+                        result_details.append({
+                            'AMI Name': ami_name,
+                            'AMI ID': ami_id,
+                            'Age (Days)': ami_age,
+                            'Creation Date': creation_date,
+                            'Service': service_name
+                        })
+                    else:
+                        print(f"{aws.log_time()} Skipping AMI (too young): {ami_name} (ID: {ami_id}, Age: {ami_age} days < {MIN_AMI_AGE_DAYS} days)")
+                        skipped_due_to_age.append({
+                            'AMI Name': ami_name,
+                            'AMI ID': ami_id,
+                            'Age (Days)': ami_age,
+                            'Creation Date': creation_date,
+                            'Service': service_name
+                        })
+                else:
+                    print(f"{aws.log_time()} AMI in use: {ami_name} (ID: {ami_id}, Age: {ami_age} days)")
+
+    # Additional AMIs cleanup for infraservices
+    if SERVICE_TYPE == "infraservices":
+        additional_amis = ["ansible-springboot", "ansible-jenkins-lite", "ansible-cpa-app-amznl3", "ansible-cpa-app-amznl2"]
+        print(f"{aws.log_time()} Processing additional infraservice AMIs: {', '.join(additional_amis)}")
+        
+        for additional_ami_name in additional_amis:
+            try:
+                for spring_name, spring_id in aws.find_latest_or_old_amis(primary_region, additional_ami_name, "old", 5):
+                    # Get AMI details for age calculation
+                    try:
+                        ami_response = client.describe_images(ImageIds=[spring_id])
+                        if ami_response['Images']:
+                            ami_age = get_ami_age_days(ami_response['Images'][0]['CreationDate'])
+                            creation_date = ami_response['Images'][0]['CreationDate'].split('T')[0]
+                        else:
+                            ami_age = 0
+                            creation_date = "Unknown"
+                    except:
+                        ami_age = 0
+                        creation_date = "Unknown"
+                    
+                    # Check if AMI is in use
+                    ami_in_use = False
+                    if len(amis_in_use) > 0:
+                        ami_in_use = spring_id in amis_in_use
+                    else:
+                        # Check against all AMIs in use if no tagged instances found
+                        for region in regions_to_check:
+                            try:
+                                region_client = get_ec2_client(region, ENV)
+                                response = region_client.describe_instances(
+                                    Filters=[
+                                        {
+                                            'Name': 'image-id',
+                                            'Values': [spring_id]
+                                        }
+                                    ]
+                                )
+                                if response['Reservations']:
+                                    ami_in_use = True
+                                    break
+                            except:
+                                continue
+                    
+                    if not ami_in_use:
+                        # Check if AMI is old enough to be deleted
+                        if ami_age >= MIN_AMI_AGE_DAYS:
+                            if ACTION == "dry-run":
+                                print(f"{aws.log_time()} [DRY-RUN] Would delete additional AMI: {spring_name} (ID: {spring_id}, Age: {ami_age} days)")
+                            elif ACTION == "cleanup":
+                                print(f"{aws.log_time()} Deleting additional AMI: {spring_name} (ID: {spring_id}, Age: {ami_age} days)")
+                                aws.aws_delete_images(primary_region, spring_id)
+                                time.sleep(10)
+                                print(f"{aws.log_time()} Successfully deleted AMI {spring_name}")
+                            
+                            result.append(spring_name)
+                            result_details.append({
+                                'AMI Name': spring_name,
+                                'AMI ID': spring_id,
+                                'Age (Days)': ami_age,
+                                'Creation Date': creation_date,
+                                'Service': additional_ami_name
+                            })
+                        else:
+                            print(f"{aws.log_time()} Skipping additional AMI (too young): {spring_name} (ID: {spring_id}, Age: {ami_age} days < {MIN_AMI_AGE_DAYS} days)")
+                            skipped_due_to_age.append({
+                                'AMI Name': spring_name,
+                                'AMI ID': spring_id,
+                                'Age (Days)': ami_age,
+                                'Creation Date': creation_date,
+                                'Service': additional_ami_name
+                            })
+                    else:
+                        print(f"{aws.log_time()} Additional AMI in use: {spring_name} (ID: {spring_id}, Age: {ami_age} days)")
+            except Exception as e:
+                print(f"{aws.log_time()} Error processing additional AMI {additional_ami_name}: {e}")
+
+    # Create detailed DataFrame
+    if result_details:
+        df_instance = pd.DataFrame(result_details)
+        # Sort by age (oldest first)
+        df_instance = df_instance.sort_values('Age (Days)', ascending=False)
+    
+    # Send email report
+    if not df_instance.empty or skipped_due_to_age:
+        print(f"{aws.log_time()} Sending email with results")
+        
+        # Style the DataFrame for better email presentation
+        action_text = "Dry-run" if ACTION == "dry-run" else "Cleanup"
+        subject = f"{ENV} - {SERVICE_TYPE.capitalize()} - AWS AMI {action_text} Notification: Multi-Region Check Results (30+ Days Filter)"
+        
+        body = f"""
+        <h2>AMI {action_text} Report - {ENV.upper()} Environment</h2>
+        <p><strong>Service Type:</strong> {SERVICE_TYPE}</p>
+        <p><strong>Action:</strong> {ACTION}</p>
+        <p><strong>Primary Region:</strong> {primary_region}</p>
+        <p><strong>Regions Checked for Usage:</strong> {', '.join(regions_to_check)}</p>
+        <p><strong>Minimum AMI Age Filter:</strong> {MIN_AMI_AGE_DAYS} days</p>
+        <p><strong>Total AMIs Processed:</strong> {len(result_details)}</p>
+        <p><strong>AMIs Skipped (too young):</strong> {len(skipped_due_to_age)}</p>
+        <p><strong>Excluded:</strong> a205159-cp-nginx-server AMIs</p>
+        """
+        
+        if result_details:
+            df_styled = df_instance.style.set_table_styles([
+                {'selector': 'th', 'props': [('background', '#ee8113'), ('color', 'black'), ('font-family', 'verdana')]},
+                {'selector': 'td', 'props': [('font-family', 'verdana')]},
+                {'selector': 'tr', 'props': [('background', '#DCDCDC')]},
+                {'selector': 'tr:hover', 'props': [('background-color', 'green')]}
+            ])
+            
+            body += f"""
+            <h3>Processed AMIs (≥{MIN_AMI_AGE_DAYS} days old, sorted by age - oldest first):</h3>
+            {df_styled.to_html()}
+            """
+        else:
+            body += f"<h3>No AMIs ≥{MIN_AMI_AGE_DAYS} days old found for processing</h3>"
+        
+        if skipped_due_to_age:
+            df_skipped = pd.DataFrame(skipped_due_to_age).sort_values('Age (Days)', ascending=False)
+            df_skipped_styled = df_skipped.style.set_table_styles([
+                {'selector': 'th', 'props': [('background', '#ffa500'), ('color', 'black'), ('font-family', 'verdana')]},
+                {'selector': 'td', 'props': [('font-family', 'verdana')]},
+                {'selector': 'tr', 'props': [('background', '#fff8dc')]},
+                {'selector': 'tr:hover', 'props': [('background-color', 'yellow')]}
+            ])
+            
+            body += f"""
+            <h3>AMIs Skipped (< {MIN_AMI_AGE_DAYS} days old):</h3>
+            {df_skipped_styled.to_html()}
+            """
+        
+        body += f"""
+        <p><em>Note: AMIs were checked for usage across both Primary Region ({PRDRegion}) and DR Region ({DRRegion}) before marking as unused. Only AMIs older than {MIN_AMI_AGE_DAYS} days are processed for deletion.</em></p>
+        """
+        
+        aws.send_mail(primary_region, subject, body)
+    else:
+        print(f"{aws.log_time()} No unused AMIs found to process")
+        # Send notification that no AMIs were found
+        subject = f"{ENV} - {SERVICE_TYPE.capitalize()} - AWS AMI {ACTION.capitalize()} Notification: No Unused AMIs Found (30+ Days Filter)"
+        body = f"""
+        <h2>AMI {ACTION.capitalize()} Report - {ENV.upper()} Environment</h2>
+        <p><strong>Service Type:</strong> {SERVICE_TYPE}</p>
+        <p><strong>Action:</strong> {ACTION}</p>
+        <p><strong>Primary Region:</strong> {primary_region}</p>
+        <p><strong>Regions Checked for Usage:</strong> {', '.join(regions_to_check)}</p>
+        <p><strong>Minimum AMI Age Filter:</strong> {MIN_AMI_AGE_DAYS} days</p>
+        <p><strong>Result:</strong> No unused AMIs ≥{MIN_AMI_AGE_DAYS} days old found</p>
+        <p><strong>Excluded:</strong> a205159-cp-nginx-server AMIs</p>
+        
+        <p>All AMIs older than {MIN_AMI_AGE_DAYS} days are currently in use across the checked regions, or no AMIs meet the age criteria.</p>
+        """
+        aws.send_mail(primary_region, subject, body)
+
+    print(f"{aws.log_time()} AMI cleanup process completed")
+    print(f"{aws.log_time()} Total AMIs processed: {len(result_details)}")
+    print(f"{aws.log_time()} AMIs skipped due to age (< {MIN_AMI_AGE_DAYS} days): {len(skipped_due_to_age)}")
+    if ACTION == "dry-run":
+        print(f"{aws.log_time()} This was a dry-run. No AMIs were actually deleted.")
+
+if __name__ == "__main__":
+    main(sys.argv)
+    
+# This is old automation code.
+# If needed in the future, uncomment and use this script.
+
+# import boto3
+# import re
+# import pandas as pd
+# import awslib as aws
+# import time
+# import yaml
+# import os
+# import sys
+# import fnmatch
+
+# with open(f"{os.getcwd()}/scripts/python/GAMI/vars.yml", "r") as f:
+#     vars = yaml.safe_load(f)
+
+# PRDRegion=str(vars["regions"]["prd"])
+# DRRegion=str(vars["regions"]["dr"])
+# #session = boto3.Session(profile_name='tr-tax-cp-preprod')
+# client = boto3.client('ec2', region_name=PRDRegion)
+
+# def describe_all_instances(TagKey, TagValue):
+#     response = client.describe_instances(
+#                                 Filters=[
+#                                     {
+#                                         'Name': f'tag:{TagKey}',
+#                                         'Values': [
+#                                             f'{TagValue}'
+#                                         ]
+#                                     }
+#                                 ]
+#                 )
+#     uni = []
+#     for info in response['Reservations']:
+#         uni.append(info['Instances'][0]['ImageId'])
+#     return uni
+
+# def list_all_service_amis(serviceName):
+#     response = client.describe_images(
+#             Filters=[
+#                 {
+#                     "Name": 'name',
+#                     "Values": [f"a205159-{serviceName}-*"]
+#                 }
+#             ],
+#             Owners=['self']
+#             )
+#     for name in response['Images']:
+#                 yield name['Name'], name['ImageId']
+
+# def list_service_names(TagKey, TagValue):
+#     response = client.describe_instances(
+#                                 Filters=[
+#                                     {
+#                                         'Name': f'tag:{TagKey}',
+#                                         'Values': [
+#                                             f'{TagValue}'
+#                                         ]
+#                                     }
+#                                 ]
+#                 )
+#     for info in response['Reservations']:
+#         id = info['Instances'][0]['ImageId']
+
+#         response = client.describe_images(
+#                             Owners=['self'],
+#                             ImageIds=[id]
+#                     )
+#         for amiInfo in response['Images']:
+#             yield re.sub('-[0-9].[0-9]*.[0-9]*.[0-9]*', '', amiInfo['Name'].replace('a205159-',''))
+
+# def uni_service(TagKey, TagValue):
+#      uni = []
+#      for names in list_service_names(TagKey, TagValue):
+#           if names not in uni:
+#             uni.append(names)
+#      for unames in uni:
+#         yield unames
+
+# def main(argv):
+#     HELP = 'delete_unused_images.py <microservices/infraservices> <dry-run|cleanup> <PreProd/Prod>'
+
+#     if len(argv) < 4:
+#         print('Missing arguments.')
+#         print('Usage: ' + HELP)
+#         sys.exit(2)
+#     elif len(argv) > 4:
+#         print("Pass only required arguments")
+#         print("usage: " + HELP)
+#         sys.exit(2)
+#     if argv[1] not in ("microservices", "infraservices") and argv[2] not in ("dry-run", "cleanup"):
+#         print("Unknown arguments")
+#         print("Usage: " + HELP)
+#         sys.exit(2)
+#     SERVICE_TYPE = argv[1]
+#     ACTION = argv[2]
+#     ENV = argv[3]
+
+#     if SERVICE_TYPE == "microservices":
+#         GlobalTagKey=str(vars["tags"]["key"])
+#         GlobalTagValue=str(vars["tags"]["value"])
+#     elif SERVICE_TYPE == "infraservices":
+#         GlobalTagKey=str(vars["infra_tags"]["key"])
+#         GlobalTagValue=str(vars["infra_tags"]["value"])
+
+#     df_instance = pd.DataFrame()
+#     df_dr_amis = pd.DataFrame()
+#     result = []
+#     result2 = []
+#     result3 = []
+#     result4 = []
+#     result5 = []
+#     for service_name in uni_service(GlobalTagKey, GlobalTagValue):
+#         for ami_name, ami_id in list_all_service_amis(service_name):
+#             if ami_id not in describe_all_instances(GlobalTagKey, GlobalTagValue):
+#                 if ACTION == "dry-run":
+#                     print(f"{aws.log_time()} running dry-run for image: {ami_name}")
+#                 elif ACTION == "cleanup":
+#                     print(f"{aws.log_time()} Deleting unused image: {ami_name}")
+#                     aws.aws_delete_images(PRDRegion, ami_id)
+#                     time.sleep(10)
+#                     print(f"{aws.log_time()} Successfully deleted image {ami_name}")
+#                 result.append(ami_name)
+#                 result2.append(ami_id)
+
+#             else:
+#                 print(f"{aws.log_time()} AMI attached. AMI Name: {ami_name} and AMI ID {ami_id}")
+#                 if ENV == "Prod":
+#                     result5.append(ami_name)
+
+#     if ENV == "Prod":
+#         if SERVICE_TYPE == "microservices":
+#             Infra_AMIs = ["a205159-ansible-springconfigserver-*", "a205159-ansible-jenkins-lite-*", "a205159-ansible-cpa-app-amznl3-*", "a205159-ansible-cpa-app-amznl2-*", "a205159-cp-nginx-server-*", "a205159-ansible-consul-*"]
+#             print(f"{aws.log_time()} Printing Prd AMI names")
+#             prd_ami_names_set = set(result5)
+#             print(prd_ami_names_set)
+#             for dr_ami_name, dr_ami_id in aws.aws_describe_dr_images(DRRegion):
+#                 if dr_ami_name not in prd_ami_names_set:
+#                     if any(fnmatch.fnmatch(dr_ami_name, pattern) for pattern in Infra_AMIs):
+#                         print(f"{aws.log_time()} Infra Services AMI")
+#                     else:
+#                         if ACTION == "dry-run":
+#                             print(f"{aws.log_time()} running dry-run for image: {dr_ami_name}")
+#                         elif ACTION == "cleanup":
+#                             print(f"{aws.log_time()} Deleting unused image: {dr_ami_name}")
+#                             aws.aws_delete_images(DRRegion, dr_ami_id)
+#                             time.sleep(10)
+#                             print(f"{aws.log_time()} Successfully deleted image {dr_ami_name}")
+#                         result3.append(dr_ami_name)
+#                         result4.append(dr_ami_id)
+
+#         if SERVICE_TYPE == "infraservices":
+#             Infra_AMIs = ["a205159-ansible-springconfigserver-*", "a205159-ansible-jenkins-lite-*", "a205159-cp-nginx-server-*", "a205159-ansible-consul-*"]
+#             prd_infra_ami_names_set = set(result5)
+#             for dr_ami_name, dr_ami_id in aws.aws_describe_dr_images(DRRegion):
+#                 if any(fnmatch.fnmatch(dr_ami_name, pattern) for pattern in Infra_AMIs):
+#                     if dr_ami_name not in prd_infra_ami_names_set:
+#                         if ACTION == "dry-run":
+#                             print(f"{aws.log_time()} running dry-run for image: {dr_ami_name}")
+#                         elif ACTION == "cleanup":
+#                             print(f"{aws.log_time()} Deleting unused image: {dr_ami_name}")
+#                             aws.aws_delete_images(DRRegion, dr_ami_id)
+#                             time.sleep(10)
+#                             print(f"{aws.log_time()} Successfully deleted image {dr_ami_name}")
+#                         result3.append(dr_ami_name)
+#                         result4.append(dr_ami_id)
+
+#      #if ENV == "Prod":
+#          #print(f"{aws.log_time()} Printing DR AMI names................")
+#          #for dr_ami_name in result:
+#              #dr_ami_ids = aws.find_dr_ami_ids(DRRegion, dr_ami_name)
+#              #for dr_ami_id in dr_ami_ids:
+#                  #if ACTION == "dry-run":
+#                      #print(f"{aws.log_time()} running dry-run for image: {dr_ami_name}")
+#                  #elif ACTION == "cleanup":
+#                      #print(f"{aws.log_time()} Deleting unused image: {ami_name}")
+#                      #aws.aws_delete_images(DRRegion, ami_id)
+#                      #time.sleep(10)
+#                      #print(f"{aws.log_time()} Successfully deleted image {ami_name}")
+#                  #result3.append(dr_ami_name)
+#                  #result4.append(dr_ami_id)
+
+#     #Additional AMIs cleanup changes
+#     if SERVICE_TYPE == "infraservices":
+#         for additional_ami_name in "ansible-springboot", "ansible-jenkins-lite", "ansible-cpa-app-amznl3", "ansible-cpa-app-amznl2":
+#             for spring_name, spring_id in aws.find_latest_or_old_amis(PRDRegion, additional_ami_name, "old", 5):
+#                 if ACTION == "dry-run":
+#                         print(f"{aws.log_time()} running dry-run for image: {spring_name}")
+#                 elif ACTION == "cleanup":
+#                         print(f"{aws.log_time()} Deleting unused image: {spring_name}")
+#                         aws.aws_delete_images(PRDRegion, spring_id)
+#                         time.sleep(10)
+#                         print(f"{aws.log_time()} Successfully deleted image {spring_name}")
+#                 result.append(spring_name)
+#                 result2.append(spring_id)
+
+#     df_instance["AMI Name"] = result
+#     df_instance["AMI ID"] = result2
+#     if not df_instance.empty:
+#         df_instance = df_instance.style.set_table_styles(
+#         [{'selector': 'th',
+#         'props': [('background', '#ee8113'),
+#                     ('color', 'black'),
+#                     ('font-family', 'verdana')]},
+#         {'selector': 'td',
+#         'props': [('font-family', 'verdana')]},
+#         {'selector': 'tr',
+#         'props': [('background', '#DCDCDC')]},
+#         {'selector': 'tr:hover',
+#         'props': [('background-color', 'green')]}
+#         ]
+#         )
+
+#     df_dr_amis["AMI Name"] = result3
+#     df_dr_amis["AMI ID"] = result4
+#     if not df_dr_amis.empty:
+#         df_dr_amis = df_dr_amis.style.set_table_styles(
+#         [{'selector': 'th',
+#         'props': [('background', '#ee8113'),
+#                     ('color', 'black'),
+#                     ('font-family', 'verdana')]},
+#         {'selector': 'td',
+#         'props': [('font-family', 'verdana')]},
+#         {'selector': 'tr',
+#         'props': [('background', '#DCDCDC')]},
+#         {'selector': 'tr:hover',
+#         'props': [('background-color', 'green')]}
+#         ]
+#         )
+#         print(f"{aws.log_time()} Sending Email with results")
+#         if ACTION == "dry-run":
+#             aws.send_mail(PRDRegion, f"{ENV} - {SERVICE_TYPE.capitalize()} - AWS AMI Dryrun Notification: Removal of Unused Amazon Machine Images", df_instance.to_html())
+#             aws.send_mail(PRDRegion, f"{ENV} - {SERVICE_TYPE.capitalize()} - AWS AMI DR Region Dryrun Notification: Removal of Unused Amazon Machine Images", df_dr_amis.to_html())
+#         elif ACTION == "cleanup":
+#             aws.send_mail(PRDRegion, f"{ENV} - {SERVICE_TYPE.capitalize()} - AWS AMI Cleanup Notification: Removal of Unused Amazon Machine Images", df_instance.to_html())
+#             aws.send_mail(PRDRegion, f"{ENV} - {SERVICE_TYPE.capitalize()} - AWS AMI DR Region Cleanup Notification: Removal of Unused Amazon Machine Images", df_dr_amis.to_html())
+
+# if __name__ == "__main__":
+#     main(sys.argv)
